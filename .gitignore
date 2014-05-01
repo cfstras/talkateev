@@ -1,2 +1,6 @@
 data/
 *.json
+src/github.com/
+talkateev
+pkg/
+bin/
