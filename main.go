@@ -11,43 +11,37 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
+	"utils"
 )
 
 var (
 	ignoreRegex = regexp.MustCompile(`^Conversation with|.* (hat sich a[nb]gemeldet` +
-		`|ist( wieder)? a[nb]wesend)\.$|^Listing members of .*|^\* .* \(.*\).*|.*\?OTR(:[A-Za-z0-9=.]+|\?v2\?)`)
+		`|ist( wieder)? a[nb]wesend)\.$|^Listing members of .*|^\* .* \(.*\).*` +
+		`|.*\?OTR(:[A-Za-z0-9=.]+` +
+		`|\?v2\?)|\(\d{2}:\d{2}:\d{2}\) _[a-zA-Z0-9]+: .* invited .*@.*\.[a-zA-Z]+_`)
 	chatRegex = regexp.MustCompile(`^\((\d{2}\.\d{2}\.\d{4} )?\d{2}:\d{2}:\d{2}\)\s[^:]+:\s*`)
-	cutRegex  = regexp.MustCompile(`https?://[^ ]+|\[[^\[\]]*\]\s*|^: |[^a-zA-Zäöü0-9 ]+`)
+	cutRegex  = regexp.MustCompile(`https?://[^ ]+|\[[^\[\]]*\]\s*|^: `)
 
 	sentenceSplit = regexp.MustCompile(`[\n\r.,]`)
 	wordSplit     = regexp.MustCompile(`[\s]`)
-	spaceReplace  = regexp.MustCompile(`[\s]+`)
+	spaceReplace  = regexp.MustCompile(`[\s]+|[^a-zA-Zäöüß0-9 ]+`)
 )
 
-const (
-	endSentence   = "\u0000"
-	startSentence = "\u0002"
-)
-
-type Node struct {
-	Count float32
-	IsEnd float32
-}
-
-type ngram map[string]map[string]*Node
+type Chain map[string][]string
 
 var stuff struct {
 	// gets every line
 	rawInput chan string
 	// gets useful lines
 	input chan string
+	// gets words, nil means end of sentence
+	words chan *string
 
-	/*
-		index 0: 1grams -> key is one word
-		index 1: 2grams -> key is two words
-		...
-	*/
-	ngrams []ngram
+	prefixLen int
+	maxLen    int
+
+	Chain Chain
 }
 
 func main() {
@@ -57,13 +51,14 @@ func main() {
 		return
 	}
 
+	stuff.prefixLen = 2
+	stuff.maxLen = 20
+
+	rand.Seed(time.Now().UnixNano())
+	stuff.Chain = make(map[string][]string)
 	stuff.input = make(chan string, 32)
 	stuff.rawInput = make(chan string, 32)
-
-	stuff.ngrams = make([]ngram, 2)
-	for i := range stuff.ngrams {
-		stuff.ngrams[i] = make(ngram)
-	}
+	stuff.words = make(chan *string, 32)
 
 	go func(output chan string) {
 		filepath.Walk("data/", visit)
@@ -71,20 +66,27 @@ func main() {
 	}(stuff.rawInput)
 
 	go lineFilter(stuff.rawInput, stuff.input)
+	go wordFilter(stuff.input, stuff.words)
 
 	finish := make(chan bool)
-	go train(stuff.input, stuff.ngrams, finish)
+	go train(stuff.words, stuff.Chain, finish, stuff.prefixLen)
 	<-finish
-	//fmt.Println("root:", stuff.root)
-	//fmt.Println("all Nodes:", stuff.allNodes)
 
-	for _, gram := range stuff.ngrams {
-		summaries(gram)
+	fmt.Println("----")
+	generateSome()
+	saveData(stuff.Chain)
+}
+
+func generateSome() {
+	for i := 0; i < 50; i++ {
+		fmt.Println(generateContent(stuff.Chain, stuff.prefixLen, stuff.maxLen))
 	}
+}
 
+func saveData(data Chain) {
 	if out, err := os.Create("ngrams.json"); err == nil {
 		defer out.Close()
-		b, err := json.MarshalIndent(stuff.ngrams, "", "\t")
+		b, err := json.MarshalIndent(data, "", "\t")
 		if err != nil {
 			fmt.Println("error saving ngrams:", err)
 		} else {
@@ -92,10 +94,6 @@ func main() {
 		}
 	} else {
 		fmt.Println("error saving ngrams:", err)
-	}
-
-	for i := 0; i < 10; i++ {
-		generateContent(stuff.ngrams)
 	}
 }
 
@@ -130,19 +128,18 @@ func lineFilter(input, output chan string) {
 		if line == "" {
 			continue
 		}
-		line = chatRegex.ReplaceAllString(line, startSentence)
+		line = chatRegex.ReplaceAllString(line, "")
 		line = cutRegex.ReplaceAllString(line, "")
 		line = strings.ToLower(line)
 		line = spaceReplace.ReplaceAllString(line, " ")
-		line += endSentence
 		output <- line
 	}
 	close(output)
 }
 
-func train(input chan string, ngrams []ngram, finish chan bool) {
+func wordFilter(input chan string, output chan *string) {
 	for line := range input {
-		line = strings.Trim(line, startSentence+endSentence+" \t\r\n.")
+		line = strings.Trim(line, " \t\r\n.")
 		sentences := sentenceSplit.Split(line, -1)
 		for _, sentence := range sentences {
 			sentence = strings.Trim(sentence, " ")
@@ -150,61 +147,34 @@ func train(input chan string, ngrams []ngram, finish chan bool) {
 				continue
 			}
 			words := wordSplit.Split(sentence, -1)
-
-			var lastPossible *Node
-			for i, word := range words {
-				for n, gram := range ngrams {
-					if i < n {
-						continue
-					}
-					prefix := strings.Join(words[len(words)-n:], " ")
-					if prefix == word {
-						continue
-					}
-					possibles := gram[prefix]
-					if possibles == nil {
-						possibles = make(map[string]*Node)
-						gram[prefix] = possibles
-					}
-					possible, ok := possibles[word]
-					if !ok {
-						possible = &Node{}
-						possibles[word] = possible
-					}
-					possible.Count++
-					lastPossible = possible
+			for _, word := range words {
+				if word != "" {
+					w := word
+					output <- &w
 				}
 			}
-			if lastPossible != nil {
-				lastPossible.IsEnd++
-			}
+			output <- nil
 		}
+	}
+	close(output)
+}
+
+func train(input chan *string, chain Chain, finish chan bool, prefixLen int) {
+	circle := utils.NewCircle(prefixLen)
+	for word := range input {
+		if word == nil {
+			circle = utils.NewCircle(prefixLen)
+			//fmt.Println()
+			continue
+		}
+		//fmt.Print(*word, " ")
+		prefix := circle.String()
+		chain[prefix] = append(chain[prefix], *word)
+		circle.Shift(*word)
 	}
 	close(finish)
 }
 
-func summaries(gram ngram) {
-	for _, nodes := range gram {
-		var endings float32
-		var count float32
-
-		for _, node := range nodes {
-			endings += node.IsEnd
-			count += node.Count
-		}
-		//count = saneNumber(log(count))
-		//endings = saneNumber(log(endings))
-		if endings == 0 {
-			endings = 1
-		}
-		for _, node := range nodes {
-			node.Count /= count
-			node.IsEnd /= endings
-			//node.Count = saneNumber(log(node.Count) / count)
-			//node.IsEnd = saneNumber(log(node.IsEnd) / endings)
-		}
-	}
-}
 func log(a float32) float32 {
 	return float32(math.Log10(float64(a)))
 }
@@ -218,55 +188,23 @@ func saneNumber(v float32) float32 {
 	return v
 }
 
-func generateContent(ngrams []ngram) {
+func generateContent(chain Chain, prefixLen, maxLen int) string {
 	str := make([]string, 0)
-	var n int
-	for i := 0; i < 30; i++ {
-		if n >= len(ngrams) {
-			n = len(ngrams) - 1
-		}
-		prefix := strings.Join(str[len(str)-n:], " ")
-		//fmt.Println("string", str, "n=", n, "- prefix:", prefix)
-		words := ngrams[n][prefix]
-		word, ending := next(words)
-		str = append(str, word)
-
-		if decide(ending * 0.001) {
+	circle := utils.NewCircle(prefixLen)
+	for i := 0; i < maxLen && !decide(0.01); i++ {
+		prefix := circle.String()
+		words := chain[prefix]
+		if words == nil || len(words) == 0 {
 			break
 		}
-		n++
+		word := words[rand.Intn(len(words))]
+		circle.Shift(word)
+		//fmt.Println("string", str, "i=", i, "- prefix:", prefix)
+		str = append(str, word)
 	}
-	fmt.Println(strings.Join(str, " "))
-	fmt.Println("---")
+	return strings.Join(str, " ") + "."
 }
 
 func decide(prob float32) bool {
 	return rand.Float32()*prob > 0.5
-}
-
-func next(words map[string]*Node) (word string, ending float32) {
-	nodes := make([]*Node, 0, len(words))
-	strings := make([]string, 0, len(words))
-	for word, node := range words {
-		nodes = append(nodes, node)
-		strings = append(strings, word)
-	}
-	if len(nodes) == 0 {
-		return "", float32(math.Inf(1))
-	}
-	scores := make([]float32, len(nodes))
-	for i, n := range nodes {
-		scores[i] = rand.Float32() * n.Count
-	}
-	var max float32
-	var maxI int
-	for i, v := range scores {
-		if v > max {
-			max = v
-			maxI = i
-		}
-	}
-	word = strings[maxI]
-	ending = nodes[maxI].IsEnd
-	return
 }
