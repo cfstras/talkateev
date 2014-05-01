@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"github.com/ChimeraCoder/anaconda"
+	"github.com/cfstras/talkateev/utils"
 	"io/ioutil"
 	"math"
 	"math/rand"
@@ -15,7 +16,6 @@ import (
 	"regexp"
 	"strings"
 	"time"
-	"utils"
 )
 
 var (
@@ -74,6 +74,7 @@ func main() {
 	maxLen := flag.Int("maxLen", 20, `maximal sentence length in words`)
 	json := flag.String("json", "", `set a file path to load in data`)
 	twitter := flag.String("twitter", "", `use a twitter account for data`)
+	purple := flag.String("purple", "", `use a libpurple directory`)
 	flag.Parse()
 
 	stuff.prefixLen = *prefixLen
@@ -90,8 +91,15 @@ func main() {
 
 	if json == nil || *json == "" {
 		if twitter == nil || *twitter == "" {
+			if purple == nil || *purple == "" {
+				fmt.Println(`please provide one of these flags:
+	-purple <~/.purple/logs>
+	-twitter <twitterUsername>
+	-json <path to saved twitter data>`)
+				return
+			}
 			fmt.Println("using data/...")
-			readFromData()
+			readFromData(*purple)
 		} else {
 			stuff.usingTwitter = *twitter
 			fmt.Println("Loading twitter of", *twitter, "...")
@@ -173,14 +181,14 @@ func readFromTwitter(auth TwitterAuth, username string) {
 	stuff.twitter = &tw
 }
 
-func readFromData() {
-	_, err := os.Stat("data/")
+func readFromData(path string) {
+	_, err := os.Stat(path)
 	if os.IsNotExist(err) {
-		fmt.Fprintln(os.Stderr, "data folder not found")
+		fmt.Fprintln(os.Stderr, path, "not found")
 		return
 	}
 	go func(output chan string) {
-		filepath.Walk("data/", visit)
+		filepath.Walk(path, visit)
 		close(output)
 	}(stuff.rawInput)
 }
