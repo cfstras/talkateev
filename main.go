@@ -3,10 +3,13 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"flag"
 	"fmt"
+	"github.com/ChimeraCoder/anaconda"
 	"io/ioutil"
 	"math"
 	"math/rand"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -25,10 +28,26 @@ var (
 
 	sentenceSplit = regexp.MustCompile(`[\n\r.,]`)
 	wordSplit     = regexp.MustCompile(`[\s]`)
-	spaceReplace  = regexp.MustCompile(`[\s]+|[^a-zA-Zäöüß0-9 ]+`)
+	spaceReplace  = regexp.MustCompile(`[\s]+|[^a-zA-Zäöü@ß0-9 ]+`)
 )
 
 type Chain map[string][]string
+
+type TwitterData struct {
+	User   string
+	Tweets []Tweet
+}
+type Tweet struct {
+	Time time.Time
+	Text string
+}
+
+type TwitterAuth struct {
+	ConsumerKey    string
+	ConsumerSecret string
+	AccessToken    string
+	AccessSecret   string
+}
 
 var stuff struct {
 	// gets every line
@@ -38,21 +57,27 @@ var stuff struct {
 	// gets words, nil means end of sentence
 	words chan *string
 
+	usingTwitter string
+	twitter      *TwitterData
+
 	prefixLen int
 	maxLen    int
 
 	Chain Chain
+
+	numSentences int
+	numWords     int
 }
 
 func main() {
-	_, err := os.Stat("data/")
-	if os.IsNotExist(err) {
-		fmt.Fprintln(os.Stderr, "data folder not found")
-		return
-	}
+	prefixLen := flag.Int("prefixLen", 2, `sets length of prefix to use`)
+	maxLen := flag.Int("maxLen", 20, `maximal sentence length in words`)
+	json := flag.String("json", "", `set a file path to load in data`)
+	twitter := flag.String("twitter", "", `use a twitter account for data`)
+	flag.Parse()
 
-	stuff.prefixLen = 2
-	stuff.maxLen = 20
+	stuff.prefixLen = *prefixLen
+	stuff.maxLen = *maxLen
 
 	rand.Seed(time.Now().UnixNano())
 	stuff.Chain = make(map[string][]string)
@@ -60,21 +85,124 @@ func main() {
 	stuff.rawInput = make(chan string, 32)
 	stuff.words = make(chan *string, 32)
 
-	go func(output chan string) {
-		filepath.Walk("data/", visit)
-		close(output)
-	}(stuff.rawInput)
-
 	go lineFilter(stuff.rawInput, stuff.input)
 	go wordFilter(stuff.input, stuff.words)
+
+	if json == nil || *json == "" {
+		if twitter == nil || *twitter == "" {
+			fmt.Println("using data/...")
+			readFromData()
+		} else {
+			stuff.usingTwitter = *twitter
+			fmt.Println("Loading twitter of", *twitter, "...")
+			auth := TwitterAuth{}
+			readFromJSON("auth.json", &auth)
+			authempt := TwitterAuth{}
+			if auth == authempt {
+				fmt.Println("error: auth is empty")
+				return
+			}
+			readFromTwitter(auth, *twitter)
+			saveData("twitter_"+*twitter+".json", stuff.twitter)
+		}
+	} else {
+		stuff.twitter = &TwitterData{}
+		readFromJSON(*json, stuff.twitter)
+	}
+
+	if stuff.twitter != nil {
+		go func(output chan string) {
+			for _, tw := range stuff.twitter.Tweets {
+				output <- tw.Text
+			}
+			close(output)
+		}(stuff.rawInput)
+	}
 
 	finish := make(chan bool)
 	go train(stuff.words, stuff.Chain, finish, stuff.prefixLen)
 	<-finish
 
+	fmt.Println("Sentences:", stuff.numSentences)
+	fmt.Println("Words:", stuff.numWords)
 	fmt.Println("----")
 	generateSome()
-	saveData(stuff.Chain)
+	saveData("chain.json", stuff.Chain)
+}
+
+func readFromTwitter(auth TwitterAuth, username string) {
+	anaconda.SetConsumerKey(auth.ConsumerKey)
+	anaconda.SetConsumerSecret(auth.ConsumerSecret)
+	api := anaconda.NewTwitterApi(auth.AccessToken, auth.AccessSecret)
+	var earliestID int64
+	earliestID = math.MaxInt64
+
+	tw := TwitterData{User: username}
+	for num := 10; num > 0; {
+		v := url.Values{}
+		v.Set("screen_name", username)
+		v.Set("count", "200")
+		if earliestID != math.MaxInt64 {
+			v.Set("max_id", fmt.Sprint(earliestID-1))
+		}
+		fmt.Println("next...")
+		tweets, err := api.GetUserTimeline(v)
+		if err != nil {
+			fmt.Println("Twitter error:", err)
+			return
+		}
+		num = len(tweets)
+		fmt.Println("data get", num, "toots")
+
+		for _, rawTweet := range tweets {
+			t, err := rawTweet.CreatedAtTime()
+			if err != nil {
+				fmt.Println("Twitter error:", err)
+				return
+			}
+			if rawTweet.Id < earliestID {
+				earliestID = rawTweet.Id
+			} else if rawTweet.Id == earliestID {
+				fmt.Println("stopping now, id", earliestID, " already got")
+				num = 0
+			}
+			tweet := Tweet{Time: t, Text: rawTweet.Text}
+			tw.Tweets = append(tw.Tweets, tweet)
+		}
+	}
+	stuff.twitter = &tw
+}
+
+func readFromData() {
+	_, err := os.Stat("data/")
+	if os.IsNotExist(err) {
+		fmt.Fprintln(os.Stderr, "data folder not found")
+		return
+	}
+	go func(output chan string) {
+		filepath.Walk("data/", visit)
+		close(output)
+	}(stuff.rawInput)
+}
+
+func readFromJSON(path string, target interface{}) {
+	_, err := os.Stat(path)
+	if os.IsNotExist(err) {
+		fmt.Fprintln(os.Stderr, path, "not found")
+		return
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return
+	}
+	defer file.Close()
+	r := bufio.NewReader(file)
+	contents, _ := ioutil.ReadAll(r)
+	err = json.Unmarshal(contents, target)
+	if err != nil {
+		fmt.Println("JSON:", err)
+	}
 }
 
 func generateSome() {
@@ -83,8 +211,8 @@ func generateSome() {
 	}
 }
 
-func saveData(data Chain) {
-	if out, err := os.Create("ngrams.json"); err == nil {
+func saveData(path string, data interface{}) {
+	if out, err := os.Create(path); err == nil {
 		defer out.Close()
 		b, err := json.MarshalIndent(data, "", "\t")
 		if err != nil {
@@ -146,11 +274,13 @@ func wordFilter(input chan string, output chan *string) {
 			if sentence == "" {
 				continue
 			}
+			stuff.numSentences++
 			words := wordSplit.Split(sentence, -1)
 			for _, word := range words {
 				if word != "" {
 					w := word
 					output <- &w
+					stuff.numWords++
 				}
 			}
 			output <- nil
@@ -191,7 +321,7 @@ func saneNumber(v float32) float32 {
 func generateContent(chain Chain, prefixLen, maxLen int) string {
 	str := make([]string, 0)
 	circle := utils.NewCircle(prefixLen)
-	for i := 0; i < maxLen && !decide(0.01); i++ {
+	for i := 0; i < maxLen && !decide(0.001); i++ {
 		prefix := circle.String()
 		words := chain[prefix]
 		if words == nil || len(words) == 0 {
